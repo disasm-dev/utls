@@ -1,15 +1,10 @@
 package tls
 
 import (
-	"bytes"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
-	"sort"
-	"sync"
 
 	"golang.org/x/crypto/cryptobyte"
 )
@@ -29,12 +24,9 @@ import (
 // identifier, which is an encoded relative object identifier.
 //
 // Note that BoringSSL copies a caller-supplied blob verbatim, which means the
-// ORDER is decided above BoringSSL, by the browser. Chromium keeps the
-// identifiers in an absl::flat_hash_set (net/ssl/ssl_config_service.cc), and
-// that set iterates in an order set by a hash seeded once per process. So one
-// browser process sends one order on every connection, over TCP and QUIC
-// alike, and the next process sends another. Two captures from different
-// Chrome launches disagree; two connections from one launch never do. Shuffle
+// ORDER is decided above BoringSSL, by the browser. Two captures of the same
+// Chrome build, one over TCP and one over QUIC, carry an identical set of
+// identifiers in a different order, so the order is not fixed. Shuffle
 // reproduces that; see the comment on the field.
 type TrustAnchorsExtension struct {
 	// TrustAnchors is the list of trust anchor identifiers, in canonical
@@ -42,65 +34,18 @@ type TrustAnchorsExtension struct {
 	// at most 255 bytes.
 	TrustAnchors [][]byte
 
-	// Shuffle emits the list in this process's order: a random order drawn
-	// once per process and kept for every connection, as one Chrome process
-	// does, rather than the order given.
+	// Shuffle permutes the list once per connection.
 	//
-	// It used to draw a fresh order for every connection. That is as visible
-	// as a fixed order, just the other way round: a browser never changes the
-	// order between two of its own connections, so two connections carrying
-	// different orders are not one browser.
+	// The order is not part of any published fingerprint hash, but it is
+	// plainly visible in the extension body, and a client that emits one fixed
+	// order where the browser varies it is distinguishable across two
+	// connections without any statistics at all. That is the same shape as the
+	// QUIC transport-parameter order.
 	Shuffle bool
 
-	// emitOrder is the order used for this connection, chosen in
+	// emitOrder is the permutation used for this connection, chosen in
 	// writeToUConn. Nil means emit TrustAnchors as given.
 	emitOrder [][]byte
-}
-
-// processAnchorKey seeds this process's trust anchor order. It is drawn on
-// first use and never changes, which is the property Chromium's per-process
-// hash seed gives its set.
-var (
-	processAnchorKeyOnce sync.Once
-	processAnchorKey     [32]byte
-)
-
-func processTrustAnchorKey() []byte {
-	processAnchorKeyOnce.Do(func() {
-		// crypto/rand does not fail on supported platforms. A zero key would
-		// still give one stable order, which is the property that matters.
-		_, _ = rand.Read(processAnchorKey[:])
-	})
-	return processAnchorKey[:]
-}
-
-// orderTrustAnchors returns anchors in the order a process holding key emits
-// them, each identifier ranked by a keyed hash of its bytes. For one key the
-// order is fixed, whatever order the list arrives in, so a TCP spec and a QUIC
-// spec listing the same set agree. Across random keys every order is equally
-// likely.
-func orderTrustAnchors(anchors [][]byte, key []byte) [][]byte {
-	type ranked struct {
-		rank uint64
-		ta   []byte
-	}
-	rs := make([]ranked, len(anchors))
-	for i, ta := range anchors {
-		m := hmac.New(sha256.New, key)
-		m.Write(ta)
-		rs[i] = ranked{binary.BigEndian.Uint64(m.Sum(nil)), ta}
-	}
-	sort.Slice(rs, func(i, j int) bool {
-		if rs[i].rank != rs[j].rank {
-			return rs[i].rank < rs[j].rank
-		}
-		return bytes.Compare(rs[i].ta, rs[j].ta) < 0
-	})
-	out := make([][]byte, len(rs))
-	for i := range rs {
-		out[i] = rs[i].ta
-	}
-	return out
 }
 
 func (e *TrustAnchorsExtension) list() [][]byte {
@@ -115,9 +60,20 @@ func (e *TrustAnchorsExtension) writeToUConn(uc *UConn) error {
 		e.emitOrder = nil
 		return nil
 	}
-	// A fresh slice rather than sorting in place, so the canonical list a spec
-	// shares between connections is never reordered underneath one of them.
-	e.emitOrder = orderTrustAnchors(e.TrustAnchors, processTrustAnchorKey())
+	// A fresh slice per connection rather than shuffling in place, so a spec
+	// shared between connections is not mutated underneath one of them.
+	out := make([][]byte, len(e.TrustAnchors))
+	copy(out, e.TrustAnchors)
+	for i := len(out) - 1; i > 0; i-- {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			e.emitOrder = nil
+			return nil
+		}
+		j := int(binary.BigEndian.Uint64(b[:]) % uint64(i+1))
+		out[i], out[j] = out[j], out[i]
+	}
+	e.emitOrder = out
 	return nil
 }
 

@@ -112,17 +112,6 @@ func permutesExtensions(id ClientHelloID) bool {
 	}
 }
 
-// PermutesExtensions reports whether UTLSIdToSpecWithSeed shuffles the
-// extensions of id's spec, which is whether the client id stands for permutes
-// its ClientHello extensions on every connection. An extension added to such a
-// spec afterwards has to land in a random movable slot too, or its fixed
-// position gives the client away. See permutesExtensions.
-func PermutesExtensions(id ClientHelloID) bool { return permutesExtensions(id) }
-
-// IsPositionInvariantExtension reports whether ext keeps its slot when a spec
-// is permuted: GREASE, padding and pre_shared_key.
-func IsPositionInvariantExtension(ext TLSExtension) bool { return positionInvariantExtension(ext) }
-
 func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	switch id {
 	case HelloChrome_58, HelloChrome_62:
