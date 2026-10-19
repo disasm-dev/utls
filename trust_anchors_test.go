@@ -15,8 +15,9 @@ const chrome152TrustAnchorsTCP = "00cc0582df13021308839a648c9b2d010d0582df130206
 	"82df13021404d67909020582df13021204d679090a0582df13020f08839a648c9b2d011304d67909" +
 	"0704d6790904"
 
-// The same extension from the same Chrome build over QUIC: an identical set of
-// identifiers in a different order.
+// The same extension from the same Chrome build over QUIC, in another capture:
+// an identical set of identifiers in a different order. Separate launches carry
+// separate orders; see TrustAnchorsExtension.Shuffle.
 const chrome152TrustAnchorsQUIC = "00cc04d679090c08839a648c9b2d010b08839a648c9b2d010a04d679090204d679090e0582df1302" +
 	"0104d679090a0582df13021404d679090708839a648c9b2d010804d679090608839a648c9b2d0107" +
 	"04d679090108839a648c9b2d010c04d679090908839a648c9b2d010d04d67909080582df13021204" +
@@ -96,7 +97,9 @@ func TestTrustAnchorsSameSetDifferentOrder(t *testing.T) {
 	}
 }
 
-// Shuffling must permute and must not lose, duplicate or corrupt an entry.
+// Shuffling must permute and must not lose, duplicate or corrupt an entry. It
+// must also hold one order for the whole process, as one Chrome process does:
+// every connection emits the same order, while processes (keys) differ.
 func TestTrustAnchorsShufflePreservesTheSet(t *testing.T) {
 	var base TrustAnchorsExtension
 	if _, err := base.Write(mustHex(t, chrome152TrustAnchorsTCP)); err != nil {
@@ -107,9 +110,16 @@ func TestTrustAnchorsShufflePreservesTheSet(t *testing.T) {
 	for _, ta := range base.TrustAnchors {
 		canonical[hex.EncodeToString(ta)]++
 	}
+	orderOf := func(anchors [][]byte) string {
+		var s string
+		for _, ta := range anchors {
+			s += hex.EncodeToString(ta) + ","
+		}
+		return s
+	}
 
 	orders := map[string]bool{}
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 50; i++ {
 		e := TrustAnchorsExtension{TrustAnchors: base.TrustAnchors, Shuffle: true}
 		if err := e.writeToUConn(nil); err != nil {
 			t.Fatalf("writeToUConn: %v", err)
@@ -123,10 +133,8 @@ func TestTrustAnchorsShufflePreservesTheSet(t *testing.T) {
 			t.Fatalf("reparse: %v", err)
 		}
 		got := map[string]int{}
-		var order string
 		for _, ta := range back.TrustAnchors {
 			got[hex.EncodeToString(ta)]++
-			order += hex.EncodeToString(ta) + ","
 		}
 		if len(got) != len(canonical) {
 			t.Fatalf("shuffle changed the identifier count: %d vs %d", len(got), len(canonical))
@@ -136,10 +144,34 @@ func TestTrustAnchorsShufflePreservesTheSet(t *testing.T) {
 				t.Fatalf("shuffle lost or duplicated %s", k)
 			}
 		}
-		orders[order] = true
+		orders[orderOf(back.TrustAnchors)] = true
 	}
-	if len(orders) < 100 {
-		t.Errorf("200 shuffles produced only %d distinct orders", len(orders))
+	if len(orders) != 1 {
+		t.Errorf("50 connections in one process emitted %d different orders, want 1", len(orders))
+	}
+	if orders[orderOf(base.TrustAnchors)] {
+		t.Error("the process order is the canonical order, so Shuffle did nothing")
+	}
+
+	// The order depends on the key and on the set, never on the order the set
+	// arrives in, so a TCP spec and a QUIC spec listing it differently agree.
+	var quic TrustAnchorsExtension
+	if _, err := quic.Write(mustHex(t, chrome152TrustAnchorsQUIC)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	key := processTrustAnchorKey()
+	if orderOf(orderTrustAnchors(base.TrustAnchors, key)) != orderOf(orderTrustAnchors(quic.TrustAnchors, key)) {
+		t.Error("the same set in two input orders came out in two orders")
+	}
+
+	// Across processes the order varies: 200 keys, 32 identifiers.
+	byKey := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		k := []byte{byte(i), byte(i >> 8), 1, 2, 3}
+		byKey[orderOf(orderTrustAnchors(base.TrustAnchors, k))] = true
+	}
+	if len(byKey) < 190 {
+		t.Errorf("200 process keys produced only %d distinct orders", len(byKey))
 	}
 
 	// And with Shuffle off, the order is exactly as configured.

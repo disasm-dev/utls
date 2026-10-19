@@ -467,6 +467,13 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	if session == nil && hello.earlyData {
 		hello.earlyData = false
 	}
+	// [uTLS] Nor on a session whose ticket did not allow early data. BoringSSL
+	// only offers it when the ticket carried max_early_data, which is what
+	// Chrome does. Deriving 0-RTT keys here anyway sent 0-RTT the server was
+	// bound to reject, and a rejected early connection is unusable.
+	if session != nil && hello.earlyData && !session.EarlyData {
+		hello.earlyData = false
+	}
 	if session != nil {
 		defer func() {
 			// If we got a handshake failure when resuming a session, throw away

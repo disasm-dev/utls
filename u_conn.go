@@ -1200,6 +1200,10 @@ func (c *UConn) Read(b []byte) (int, error) {
 	c.in.Lock()
 	defer c.in.Unlock()
 
+	if err := c.finishFalseStartLocked(); err != nil { // [uTLS]
+		return 0, err
+	}
+
 	for c.input.Len() == 0 {
 		if err := c.readRecord(); err != nil {
 			return 0, err

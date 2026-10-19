@@ -387,8 +387,7 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 		}
 		if pskSuite.hash == hs.suite.hash {
 			// Update binders and obfuscated_ticket_age.
-			ticketAge := c.config.time().Sub(time.Unix(int64(hs.session.createdAt), 0))
-			hello.pskIdentities[0].obfuscatedTicketAge = uint32(ticketAge/time.Millisecond) + hs.session.ageAdd
+			hello.pskIdentities[0].obfuscatedTicketAge = c.config.obfuscatedTicketAge(c.config.time(), hs.session.createdAt, hs.session.ageAdd) // [uTLS]
 
 			transcript := hs.suite.hash.New()
 			transcript.Write([]byte{typeMessageHash, 0, 0, uint8(len(chHash))})
@@ -415,9 +414,32 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 	// and utlsExtensionPadding are supposed to change
 	if hs.uconn != nil {
 		if hs.uconn.ClientHelloID != HelloGolang {
-			if len(hs.hello.pskIdentities) > 0 {
-				// TODO: wait for someone who cares about PSK to implement
+			// A resumption offered in the first ClientHello is offered again,
+			// as BoringSSL does, rather than killing the handshake. The code
+			// above has already decided the crypto/tls side: it either kept
+			// the PSK with a recomputed ticket age, or dropped it because the
+			// server chose a cipher suite whose hash differs from the
+			// session's. BoringSSL's should_offer_psk makes the same call, so
+			// the extension list follows it here, and the binder is computed
+			// once the second ClientHello has been marshalled.
+			psk, pskIndex := (*UtlsPreSharedKeyExtension)(nil), -1
+			for i, ext := range hs.uconn.Extensions {
+				if p, ok := ext.(*UtlsPreSharedKeyExtension); ok && p.Session != nil && p.Len() > 0 {
+					psk, pskIndex = p, i
+				}
+			}
+			if (psk == nil && len(hs.hello.pskIdentities) > 0) || (psk != nil && hs.echContext != nil) {
 				return errors.New("uTLS does not support reprocessing of PSK key triggered by HelloRetryRequest")
+			}
+			if psk != nil {
+				if len(hs.hello.pskIdentities) == 0 {
+					exts := make([]TLSExtension, 0, len(hs.uconn.Extensions)-1)
+					exts = append(exts, hs.uconn.Extensions[:pskIndex]...)
+					hs.uconn.Extensions = append(exts, hs.uconn.Extensions[pskIndex+1:]...)
+					psk = nil
+				} else {
+					psk.Identities[0].ObfuscatedTicketAge = hs.hello.pskIdentities[0].obfuscatedTicketAge
+				}
 			}
 
 			keyShareExtFound := false
@@ -472,6 +494,20 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 			}
 			if err := hs.uconn.MarshalClientHelloNoECH(); err != nil {
 				return err
+			}
+			if psk != nil {
+				// RFC 8446 4.2.11.2: after a HelloRetryRequest the binder
+				// covers the message_hash of the first ClientHello, the
+				// HelloRetryRequest, then this ClientHello up to the binders.
+				transcript := hs.suite.hash.New()
+				transcript.Write([]byte{typeMessageHash, 0, 0, uint8(len(chHash))})
+				transcript.Write(chHash)
+				if err := transcriptMsg(hs.serverHello, transcript); err != nil {
+					return err
+				}
+				if err := psk.patchBinders(hs.uconn.HandshakeState.Hello, transcript); err != nil {
+					return err
+				}
 			}
 			hs.hello.original = hs.uconn.HandshakeState.Hello.Raw
 		}

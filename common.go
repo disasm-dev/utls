@@ -732,6 +732,39 @@ type Config struct {
 	// By default, utls throws an exception in such scenarios. Set this to true to skip the resumption and suppress the exception.
 	PreferSkipResumptionOnNilExtension bool // [uTLS]
 
+	// TicketAgeWholeSeconds reports the ticket age in a resumed TLS 1.3
+	// ClientHello the way BoringSSL does, in whole seconds scaled to
+	// milliseconds, instead of to the millisecond as Go and NSS do.
+	// Set it when mirroring a BoringSSL client (Chromium, Safari). See
+	// [Config.obfuscatedTicketAge].
+	TicketAgeWholeSeconds bool // [uTLS]
+
+	// OmitCloseNotify makes Close end the connection without sending a
+	// close_notify alert first, as Chromium does: SSLClientSocketImpl's
+	// Disconnect drops the socket and never calls SSL_shutdown, so a
+	// Chrome connection just ends at the TCP layer. CloseWrite still sends
+	// the alert, since sending it is all CloseWrite is for.
+	OmitCloseNotify bool // [uTLS]
+
+	// DeferKeyUpdateReply holds the answer to a peer's KeyUpdate
+	// (update_requested) until this side next writes application data, as
+	// BoringSSL does: tls13_receive_key_update queues the reply in the
+	// pending flight, which goes out ahead of the next application record.
+	// RFC 8446 4.6.3 only asks for it "prior to sending its next Application
+	// Data record". Go answers at once, so an idle connection that receives
+	// a KeyUpdate replies on its own, which a BoringSSL client never does.
+	DeferKeyUpdateReply bool // [uTLS]
+
+	// FalseStart lets a TLS 1.2 full handshake return as soon as the client
+	// Finished is sent, before the server's Finished arrives, so application
+	// data can leave one round trip early (RFC 7918). The server's
+	// ChangeCipherSpec and Finished are read and verified before the first
+	// Read returns any data. It applies only where BoringSSL's
+	// ssl_can_false_start allows it: TLS 1.2, a full handshake, an ECDHE key
+	// exchange with an AEAD cipher, and a negotiated ALPN protocol. Chromium
+	// sets SSL_MODE_ENABLE_FALSE_START on every connection.
+	FalseStart bool // [uTLS]
+
 	// CipherSuites is a list of enabled TLS 1.0–1.2 cipher suites. The order of
 	// the list is ignored. Note that TLS 1.3 ciphersuites are not configurable.
 	//
@@ -1020,6 +1053,10 @@ func (c *Config) Clone() *Config {
 		autoSessionTicketKeys:               c.autoSessionTicketKeys,
 
 		PreferSkipResumptionOnNilExtension: c.PreferSkipResumptionOnNilExtension, // [UTLS]
+		TicketAgeWholeSeconds:              c.TicketAgeWholeSeconds,              // [UTLS]
+		OmitCloseNotify:                    c.OmitCloseNotify,                    // [UTLS]
+		DeferKeyUpdateReply:                c.DeferKeyUpdateReply,                // [UTLS]
+		FalseStart:                         c.FalseStart,                         // [UTLS]
 	}
 }
 

@@ -3,6 +3,7 @@ package tls
 import (
 	"encoding/json"
 	"errors"
+	"hash"
 	"io"
 
 	"golang.org/x/crypto/cryptobyte"
@@ -292,6 +293,18 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 	if e.SkipBinderPatching {
 		return nil
 	}
+	if err := e.patchBinders(hello, e.cipherSuite.hash.New()); err != nil {
+		return err
+	}
+	return io.EOF
+}
+
+// patchBinders computes the binder over transcript followed by hello up to
+// its binders, and writes it into hello.Raw. For a first ClientHello the
+// transcript is empty. After a HelloRetryRequest it already holds the
+// message_hash standing in for the first ClientHello and the
+// HelloRetryRequest itself (RFC 8446, 4.2.11.2 and 4.4.1).
+func (e *UtlsPreSharedKeyExtension) patchBinders(hello *PubClientHelloMsg, transcript hash.Hash) error { // [uTLS]
 	private := hello.getCachedPrivatePtr()
 	if private == nil {
 		private = hello.getPrivatePtr()
@@ -300,7 +313,6 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 	private.pskBinders = e.Binders // set the placeholder to the private Hello
 
 	//--- mirror loadSession() begin ---//
-	transcript := e.cipherSuite.hash.New()
 	helloBytes, err := private.marshalWithoutBinders() // no marshal() will be actually called, as we have set the field `raw`
 	if err != nil {
 		return err
@@ -331,7 +343,7 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 
 	// no need to care about other PSK related fields, they will be handled separately
 
-	return io.EOF
+	return nil
 }
 
 func (e *UtlsPreSharedKeyExtension) Write(b []byte) (int, error) {

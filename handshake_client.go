@@ -554,10 +554,9 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	}
 
 	// Set the pre_shared_key extension. See RFC 8446, Section 4.2.11.1.
-	ticketAge := c.config.time().Sub(time.Unix(int64(session.createdAt), 0))
 	identity := pskIdentity{
 		label:               session.ticket,
-		obfuscatedTicketAge: uint32(ticketAge/time.Millisecond) + session.ageAdd,
+		obfuscatedTicketAge: c.config.obfuscatedTicketAge(c.config.time(), session.createdAt, session.ageAdd), // [uTLS]
 	}
 	hello.pskIdentities = []pskIdentity{identity}
 	hello.pskBinders = [][]byte{make([]byte, cipherSuite.hash.Size())}
@@ -667,6 +666,13 @@ func (hs *clientHandshakeState) handshake() error {
 			return err
 		}
 		c.clientFinishedIsFirst = true
+		if hs.canFalseStart() { // [uTLS] FalseStart
+			// Hand the connection back now so application data can follow
+			// the client Finished; Read reads and verifies the rest first.
+			c.falseStartFinish = hs.finishHandshake
+			c.isHandshakeComplete.Store(true)
+			return nil
+		}
 		if err := hs.readSessionTicket(); err != nil {
 			return err
 		}
@@ -681,6 +687,43 @@ func (hs *clientHandshakeState) handshake() error {
 	c.ekm = ekmFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.hello.random, hs.serverHello.random)
 	c.isHandshakeComplete.Store(true)
 
+	return nil
+}
+
+// canFalseStart reports whether this handshake may return before the server's
+// Finished; see Config.FalseStart. The conditions are BoringSSL's
+// ssl_can_false_start: TLS 1.2 with an ECDHE key exchange and an AEAD cipher,
+// the strongest pre-1.3 settings, since False Start forgoes the Finished
+// check's downgrade protection until the first read; an ALPN protocol, which
+// BoringSSL requires by default; and no ECH offered, because an ECH that
+// TLS 1.2 has rejected must be authenticated by a completed handshake. It is
+// only reached on a full handshake: on a resumption the server's Finished
+// arrives first anyway.
+func (hs *clientHandshakeState) canFalseStart() bool { // [uTLS]
+	c := hs.c
+	return c.config.FalseStart &&
+		c.vers == VersionTLS12 &&
+		hs.suite.flags&suiteECDHE != 0 &&
+		hs.suite.aead != nil &&
+		c.clientProtocol != "" &&
+		c.config.EncryptedClientHelloConfigList == nil
+}
+
+// finishHandshake reads what a False Started handshake returned without: the
+// server's session ticket, ChangeCipherSpec and Finished. Read runs it before
+// any application data is handed over. c.in must be held.
+func (hs *clientHandshakeState) finishHandshake() error { // [uTLS]
+	c := hs.c
+	if err := hs.readSessionTicket(); err != nil {
+		return err
+	}
+	if err := hs.readFinished(c.serverFinished[:]); err != nil {
+		return err
+	}
+	if err := hs.saveSessionTicket(); err != nil {
+		return err
+	}
+	c.ekm = ekmFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.hello.random, hs.serverHello.random)
 	return nil
 }
 

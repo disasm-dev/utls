@@ -89,6 +89,16 @@ type Conn struct {
 	// alertCloseNotify record.
 	closeNotifySent bool
 
+	// keyUpdateReplyPending is true while a KeyUpdate owed to the peer waits
+	// for the next application write; see Config.DeferKeyUpdateReply. It is
+	// guarded by out's mutex.
+	keyUpdateReplyPending bool // [uTLS]
+
+	// falseStartFinish completes a handshake that returned before the
+	// server's Finished under Config.FalseStart. Read runs it before handing
+	// over any data. It is guarded by in's mutex.
+	falseStartFinish func() error // [uTLS]
+
 	// clientFinished and serverFinished contain the Finished message sent
 	// by the client or server in the most recent handshake. This is
 	// retained to support the renegotiation extension and tls-unique
@@ -1255,6 +1265,21 @@ func (c *Conn) Write(b []byte) (int, error) {
 		}
 	}
 
+	if c.keyUpdateReplyPending { // [uTLS] DeferKeyUpdateReply
+		// BoringSSL flushes its pending flight into the same write as the
+		// application data behind it, so both records leave together.
+		c.buffering = true
+		if err := c.sendKeyUpdateReplyLocked(); err != nil {
+			c.sendBuf, c.buffering = nil, false
+			return m, c.out.setErrorLocked(err)
+		}
+		n, err := c.writeRecordLocked(recordTypeApplicationData, b)
+		if _, ferr := c.flush(); err == nil {
+			err = ferr
+		}
+		return n + m, c.out.setErrorLocked(err)
+	}
+
 	n, err := c.writeRecordLocked(recordTypeApplicationData, b)
 	return n + m, c.out.setErrorLocked(err)
 }
@@ -1353,22 +1378,60 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 		c.out.Lock()
 		defer c.out.Unlock()
 
-		msg := &keyUpdateMsg{}
-		msgBytes, err := msg.marshal()
-		if err != nil {
-			return err
-		}
-		_, err = c.writeRecordLocked(recordTypeHandshake, msgBytes)
-		if err != nil {
-			// Surface the error at the next write.
-			c.out.setErrorLocked(err)
+		if c.config.DeferKeyUpdateReply { // [uTLS]
+			// Owed, not sent: Write sends it ahead of the next application
+			// data. A second request before then still owes one reply.
+			c.keyUpdateReplyPending = true
 			return nil
 		}
 
-		newSecret := cipherSuite.nextTrafficSecret(c.out.trafficSecret)
-		c.out.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret)
+		if err := c.sendKeyUpdateReplyLocked(); err != nil {
+			// Surface the error at the next write.
+			c.out.setErrorLocked(err)
+		}
 	}
 
+	return nil
+}
+
+// finishFalseStartLocked completes a False Started handshake if one is
+// pending, so nothing the server sends is taken as application data before
+// its Finished has been verified. A failure fails both directions, as the
+// handshake failing would have. c.in must be held.
+func (c *Conn) finishFalseStartLocked() error { // [uTLS]
+	finish := c.falseStartFinish
+	if finish == nil {
+		return nil
+	}
+	c.falseStartFinish = nil
+	if err := finish(); err != nil {
+		c.out.Lock()
+		c.out.setErrorLocked(err)
+		c.out.Unlock()
+		return c.in.setErrorLocked(err)
+	}
+	return nil
+}
+
+// sendKeyUpdateReplyLocked sends a KeyUpdate (update_not_requested) under the
+// current write key and then moves this side to the next one. c.out must be
+// held.
+func (c *Conn) sendKeyUpdateReplyLocked() error {
+	c.keyUpdateReplyPending = false
+	cipherSuite := cipherSuiteTLS13ByID(c.cipherSuite)
+	if cipherSuite == nil {
+		return alertInternalError
+	}
+	msg := &keyUpdateMsg{}
+	msgBytes, err := msg.marshal()
+	if err != nil {
+		return err
+	}
+	if _, err := c.writeRecordLocked(recordTypeHandshake, msgBytes); err != nil {
+		return err
+	}
+	newSecret := cipherSuite.nextTrafficSecret(c.out.trafficSecret)
+	c.out.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret)
 	return nil
 }
 
@@ -1390,6 +1453,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 
 	c.in.Lock()
 	defer c.in.Unlock()
+
+	if err := c.finishFalseStartLocked(); err != nil { // [uTLS]
+		return 0, err
+	}
 
 	for c.input.Len() == 0 {
 		if err := c.readRecord(); err != nil {
@@ -1445,7 +1512,7 @@ func (c *Conn) Close() error {
 	}
 
 	var alertErr error
-	if c.isHandshakeComplete.Load() {
+	if c.isHandshakeComplete.Load() && !c.config.OmitCloseNotify { // [uTLS] OmitCloseNotify
 		if err := c.closeNotify(); err != nil {
 			alertErr = fmt.Errorf("tls: failed to send closeNotify alert (but connection was closed anyway): %w", err)
 		}
